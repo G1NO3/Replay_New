@@ -154,6 +154,8 @@ def draw_hipp_info_decoding_acc():
 
 if __name__ == '__main__':
 
+    pass
+    
     # import pickle
     # prefix = 'nb_nstd_mem5'
     # line_chart_info = pickle.load(open('./figures/'+prefix+'/line_chart.pkl', 'rb'))
@@ -172,12 +174,12 @@ if __name__ == '__main__':
     # kl_mean, kl_std, step_count_mean, step_count_std = pickle.load(open('./figures/'+prefix+'/Ablation_KL_div.pkl','rb')).values()
     # print(step_count_mean, step_count_std)
     # draw_hipp_info_decoding_acc()
-    key = jax.random.PRNGKey(0)
-    subkeys = jax.random.split(key, 6)
-    replay_keys = jnp.concatenate((jnp.zeros_like(subkeys[:1]), subkeys[1:]),0)
-    print(len(subkeys))
-    print(replay_keys.dtype)
-    for i in range(6):
-        noise = jax.random.normal(replay_keys[i], (1,2))
-        print(jnp.where((replay_keys[i]!=0).all(),noise,jnp.zeros_like(noise)))
+    # key = jax.random.PRNGKey(0)
+    # subkeys = jax.random.split(key, 6)
+    # replay_keys = jnp.concatenate((jnp.zeros_like(subkeys[:1]), subkeys[1:]),0)
+    # print(len(subkeys))
+    # print(replay_keys.dtype)
+    # for i in range(6):
+    #     noise = jax.random.normal(replay_keys[i], (1,2))
+    #     print(jnp.where((replay_keys[i]!=0).all(),noise,jnp.zeros_like(noise)))
     # print(jax.random.normal(replay_keys[0], (2,2)))
