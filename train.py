@@ -61,7 +61,7 @@ def parse_args():
     parser.add_argument('--hippo_pred_len', type=int, default=5)
     parser.add_argument('--pc_sigma', type=float, default=1)
 
-    parser.add_argument('--eval_temperature', type=float, default=0.5)
+    parser.add_argument('--eval_temperature', type=float, default=1)
     args = parser.parse_args()
     return args
 
@@ -108,7 +108,10 @@ def train_step(states, batch, replay_steps, clip_param, entropy_coef, n_train_ti
     jax.debug.print('replay ratio all {a}', a=jnp.where(rewards > 0, 1, 0).mean())
     key, subkey = jax.random.split(key) 
 
-
+    # s_a_r_d_sprime = jnp.concatenate((batch['prev_s'], batch['prev_action'], batch['oe_ae_r'][..., -1:], batch['done'], batch['next_s']), -1)
+    # next_policy_next_a = jnp.concatenate((batch['logits'], batch['next_action']), -1)
+    # jax.debug.print('s_a_r_d_sprime shape:{a}, value:{b}', a=s_a_r_d_sprime.shape, b=s_a_r_d_sprime[:,0])
+    # jax.debug.print('next_policy_next_a shape:{a}, value:{b}', a=next_policy_next_a.shape, b=next_policy_next_a[:,0])
     def loss_fn(policy_params, hippo_params, encoder_params, batch, key):
         """Train the hippocampus and the prefrontal cortex"""
         # his_theta [l, n, h]
@@ -123,13 +126,13 @@ def train_step(states, batch, replay_steps, clip_param, entropy_coef, n_train_ti
         def propagate_theta_hippo(key, index, policy_scan_len):
             replay_fn_to_scan = partial(replay_fn, policy_params=policy_params, hippo_state=hippo_state, policy_state=policy_state,
                                     oe_ae_r=jnp.zeros_like(batch['oe_ae_r'][0]))
-            def propagate_hippo_once(prev_hippo_hidden, input_of_hippo, theta):
-                obs, prev_action, prev_reward = input_of_hippo
+            def propagate_hippo_once(prev_hippo_hidden, input_of_hippo):
+                prev_theta, obs, prev_action, prev_reward = input_of_hippo # ot, at-1, rt-1, θt-1
                 obs_embed, action_embed = encoder_state.apply_fn({'params': encoder_params},
                                                                 obs, prev_action)
                 oe_ae_r = jnp.concatenate((obs_embed, action_embed, prev_reward), axis=-1)
                 new_hidden, output, theta_info = hippo_state.apply_fn({'params': hippo_params},
-                                                                    prev_hippo_hidden, theta, oe_ae_r)
+                                                                    prev_hippo_hidden, prev_theta, oe_ae_r)
                 return new_hidden, output
         
             def propagate_theta_once(prev_theta, input_of_policy):
@@ -145,9 +148,12 @@ def train_step(states, batch, replay_steps, clip_param, entropy_coef, n_train_ti
                                                                         xs=replay_keys)
                 # replayed_theta = prev_theta
                 # replayed_hippo_hidden = hippo_hidden
-                replayed_theta = jnp.where(rewards > 0, replayed_theta, prev_theta)
-                replayed_hippo_hidden = jnp.where(rewards > 0, replayed_hippo_hidden,
-                                                jnp.zeros(replayed_hippo_hidden.shape))
+
+                ### Gated by reward
+                # replayed_theta = jnp.where(rewards > 0, replayed_theta, prev_theta)
+                # replayed_hippo_hidden = jnp.where(rewards > 0, replayed_hippo_hidden,
+                #                                 jnp.zeros(replayed_hippo_hidden.shape))
+
                 # replayed_hippo_hidden = jnp.zeros(replayed_hippo_hidden.shape)
                 key, dropout_key = jax.random.split(key)
                 # outside_hipp_info = jnp.zeros((n_agents, bottleneck_size))
@@ -168,10 +174,11 @@ def train_step(states, batch, replay_steps, clip_param, entropy_coef, n_train_ti
             # done_to_scan = jnp.take(batch['done'], indexes_for_propagate_once, axis=0) # done t-1
             prev_action_to_scan = jnp.take(batch['prev_action'], indexes_for_propagate_once, axis=0) # at-1
             prev_reward_to_scan = oe_ae_r_to_scan[..., -1:] # rt-1
+            prev_theta_to_scan = jnp.take(batch['theta'], indexes_for_propagate_once, axis=0) # theta t-1
 
-            new_hippo_hidden, hist_hippo_output = jax.lax.scan(partial(propagate_hippo_once, theta=theta_zero),
+            new_hippo_hidden, hist_hippo_output = jax.lax.scan(propagate_hippo_once,
                                                          init=jnp.take(batch['hippo_hidden'], index, axis=0),
-                                                        xs=(obs_to_scan, prev_action_to_scan, prev_reward_to_scan))
+                                                        xs=(prev_theta_to_scan, obs_to_scan, prev_action_to_scan, prev_reward_to_scan))
             new_theta, (_, hist_policy, hist_value) = jax.lax.scan(propagate_theta_once,
                                                                    init=jnp.take(batch['theta'], index, axis=0),
                                                                    xs=(key_to_scan, oe_ae_r_to_scan, 
@@ -193,33 +200,36 @@ def train_step(states, batch, replay_steps, clip_param, entropy_coef, n_train_ti
         key, key_to_propagate = key_to_propagate[0], key_to_propagate[1:]
         scan_policy_logits, scan_value, scan_hippo_output = jax.vmap(propagate_theta_hippo_for_seq, (0, 0), 0)(
             key_to_propagate, jnp.arange(sample_len - policy_scan_len))
-        # [t, policy_scan_len, n, h], [t, policy_scan_len, n, 4], [t, policy_scan_len, n, 1]
+        # [b-psl, psl, n, h], [b-psl, psl, n, 1], [b-psl, psl, n, h], all at time t (received the input ot, at-1 and rt-1)
 
 
         ## Calculate hippo loss
         def hippo_loss(all_preds, index):
             index_to_scan = jnp.arange(sample_len - policy_scan_len) + index
-            next_s_label_to_scan = jnp.take(next_s_label, index_to_scan, axis=0) # [t, n, 2]
+            next_s_label_to_scan = jnp.take(next_s_label, index_to_scan, axis=0) # [t, n, 1]
+            next_s_to_scan = jnp.take(batch['next_s'], index_to_scan, axis=0) # [t, n, 2]
             def generate_place_cell(x):
                 centers = pc_centers
                 sigma = pc_sigma
                 # x[n, 2], centers[m, 2]
                 @jax.jit
-                def cal_dist(pos, cents, sigma):
+                def cal_dist(pos):
+                    assert pos.shape == (2,)
                     # pos[2,], cents[m, 2]
-                    return - ((pos.reshape((1, -1)) - cents) ** 2).sum(axis=-1) / (2 * sigma ** 2)  # [m,]
-                activation = jax.vmap(cal_dist, (0, None, None), 0)(x, centers, sigma)  # [n, m]
+                    return - ((pos.reshape((1, -1)) - centers) ** 2).sum(axis=-1) / (2 * sigma ** 2)  # [m,]
+                activation = jax.vmap(cal_dist)(x)  # [n, m]
+                assert activation.shape == (x.shape[0], centers.shape[0])
                 activation = nn.softmax(activation, axis=-1)
                 return activation
             
-            place_cell_activation = jax.vmap(generate_place_cell)(next_s_label_to_scan) # [t, n, m]
+            place_cell_activation = jax.vmap(generate_place_cell)(next_s_to_scan) # [t, n, m]
             
 
             preds_place = all_preds[:, :, :num_cells]
             mem_preds_rewards = all_preds[:, :, num_cells:]  # [l, n, 1+hml]
-            preds_rewards = mem_preds_rewards[-hippo_pred_len:,:,-1]  # [hpl, n]
+            preds_rewards = mem_preds_rewards[-hippo_pred_len-1:-1,:,-1]  # [hpl, n]
 
-            mem_rewards = mem_preds_rewards[-hippo_pred_len,:,:-1]  # [n, hml]
+            mem_rewards = mem_preds_rewards[-hippo_pred_len-1,:,:-1]  # [n, hml]
             mem_rewards = jnp.transpose(mem_rewards, (1, 0))  # [hml, n]
 
             loss_pathint = optax.softmax_cross_entropy(preds_place, place_cell_activation).mean()
@@ -229,7 +239,7 @@ def train_step(states, batch, replay_steps, clip_param, entropy_coef, n_train_ti
             acc_pred = (jnp.argmax(preds_place, axis=-1) == next_s_label_to_scan).astype(jnp.float32).mean()
 
             # pred last
-            rewards = batch['oe_ae_r'][:, :, -1]  # [l, n]
+            rewards = batch['oe_ae_r'][:, :, -1]  # [l, n] # rt-1
             rewards_label = rewards[-(hippo_pred_len+hippo_mem_len):]  # [hpl+hml, n]  # todo: 1: :-1; only predict the last one
             # rewards_label = batch['rewards'][-(hippo_pred_len+hippo_mem_len):-hippo_pred_len,:,0]
             # state = jnp.concatenate((batch['action'], batch['current_pos'], batch['rewards'], preds_rewards, \
@@ -522,7 +532,8 @@ def init_states(args, initkey):
         hippo_hidden,
         # next_s
         jnp.zeros((args.n_agents, 2), dtype=jnp.int8),
-        # 
+        # current s
+        jnp.zeros((args.n_agents, 2), dtype=jnp.int8)
     ]
 
     buffer_state = buffer.create_buffer_states(args.max_size, init_samples_for_buffer)
@@ -583,8 +594,10 @@ def model_env_step(states, key, s, a, hippo_hidden, theta, temperature, replay_s
     # replayed_theta = theta
     # replayed_hippo_hidden = new_hippo_hidden
     
-    replayed_theta = jnp.where(rewards > 0, replayed_theta, theta)
-    replayed_hippo_hidden = jnp.where(rewards > 0, replayed_hippo_hidden, jnp.zeros(replayed_hippo_hidden.shape))
+    ## Gated by reward
+    # replayed_theta = jnp.where(rewards > 0, replayed_theta, theta)
+    # replayed_hippo_hidden = jnp.where(rewards > 0, replayed_hippo_hidden, jnp.zeros(replayed_hippo_hidden.shape))
+
     # replayed_hippo_hidden = jnp.zeros(replayed_hippo_hidden.shape)
     # Take action ==================================================================================
 
@@ -599,7 +612,7 @@ def model_env_step(states, key, s, a, hippo_hidden, theta, temperature, replay_s
     buffer_state = buffer.put_to_buffer(buffer_state,
                                         [oe_ae_r, hippo_hidden, theta,
                                          next_a, policy, value, done, obs, a,
-                                         new_hippo_hidden, next_s])
+                                         new_hippo_hidden, next_s, s])
     # reset if out of time
     # reset_theta = jnp.where(done & jnp.isclose(rewards, 0.), jnp.zeros(new_theta.shape), new_theta)
     # reset_hippo_hidden = jnp.where(done & jnp.isclose(rewards, 0.), jnp.zeros(new_hippo_hidden.shape), new_hippo_hidden)
@@ -607,7 +620,7 @@ def model_env_step(states, key, s, a, hippo_hidden, theta, temperature, replay_s
 
 @partial(jax.jit, static_argnames=['temperature', 'replay_steps'])
 def eval_step(states, key, s, a, hippo_hidden, theta, temperature, replay_steps):
-    env_state, buffer_state, encoder_state, hippo_state, policy_state = states
+    env_state, encoder_state, hippo_state, policy_state = states
     # Input: actions_t-1, h_t-1, theta_t-1,
     key, subkey = jax.random.split(key)
     next_s, rewards, done, env_state = env.step(subkey, env_state, s, a)
@@ -641,8 +654,10 @@ def eval_step(states, key, s, a, hippo_hidden, theta, temperature, replay_steps)
     # replayed_theta = theta
     # replayed_hippo_hidden = new_hippo_hidden
     
-    replayed_theta = jnp.where(rewards > 0, replayed_theta, theta)
-    replayed_hippo_hidden = jnp.where(rewards > 0, replayed_hippo_hidden, jnp.zeros(replayed_hippo_hidden.shape))
+    ## Gated by reward
+    # replayed_theta = jnp.where(rewards > 0, replayed_theta, theta)
+    # replayed_hippo_hidden = jnp.where(rewards > 0, replayed_hippo_hidden, jnp.zeros(replayed_hippo_hidden.shape))
+
     # replayed_hippo_hidden = jnp.zeros(replayed_hippo_hidden.shape)
     # Take action ==================================================================================
 
@@ -654,14 +669,7 @@ def eval_step(states, key, s, a, hippo_hidden, theta, temperature, replay_steps)
     # new_actions = jnp.argmax(policy, axis=-1, keepdims=True)
     next_a = sample_from_policy(policy, subkey, temperature)
     # fixme: reset reward; consider the checkpoint logic of env
-    buffer_state = buffer.put_to_buffer(buffer_state,
-                                        [oe_ae_r, hippo_hidden, theta,
-                                         next_a, policy, value, done, obs, a,
-                                         new_hippo_hidden, next_s])
-    # reset if out of time
-    # reset_theta = jnp.where(done & jnp.isclose(rewards, 0.), jnp.zeros(new_theta.shape), new_theta)
-    # reset_hippo_hidden = jnp.where(done & jnp.isclose(rewards, 0.), jnp.zeros(new_hippo_hidden.shape), new_hippo_hidden)
-    return env_state, buffer_state, new_hippo_hidden, new_theta, next_s, next_a, rewards, done, replayed_history
+    return env_state, new_hippo_hidden, new_theta, next_s, next_a, rewards, done, replayed_history
 
 def eval(states, key, args):
     '''
@@ -669,8 +677,8 @@ def eval(states, key, args):
     replay_path = [[[] for n in range(args.n_agents)],[[] for n in range(args.n_agents)]]
     hist_state = []
     '''
-    buffer_state, encoder_state, hippo_state, policy_state = states
-    all_rewards = []
+    encoder_state, hippo_state, policy_state = states
+    all_rewards = jnp.zeros((args.n_eval_steps,))
     key, subkey = jax.random.split(key)
     maze_list = jnp.load('maze_list.npy')
     wall_maze = jnp.repeat(maze_list[0].reshape(1,args.grid_size,args.grid_size,args.n_action), args.n_agents, axis=0)
@@ -680,13 +688,13 @@ def eval(states, key, args):
     a = jax.random.randint(subkey, (args.n_agents, 1), 0, args.n_action)
     hippo_hidden = jnp.zeros((args.n_agents, args.hippo_hidden_size))
     theta = jnp.zeros((args.n_agents, args.theta_hidden_size))
-    for _ in range(args.n_eval_steps):
+    for i in range(args.n_eval_steps):
         key, subkey = jax.random.split(subkey)
-        env_state, buffer_state, hippo_hidden, theta, next_s, next_a, rewards, done, replayed_history \
-            = eval_step((env_state, buffer_state, encoder_state, hippo_state, policy_state),
+        env_state, hippo_hidden, theta, next_s, next_a, rewards, done, replayed_history \
+            = eval_step((env_state, encoder_state, hippo_state, policy_state),
                          subkey, s, a, hippo_hidden, theta, temperature=args.eval_temperature, replay_steps=args.replay_steps)
-        all_rewards.append(rewards.mean().item())
-    return sum(all_rewards) / len(all_rewards)
+        all_rewards = all_rewards.at[i].set(rewards.mean().item())
+    return all_rewards.mean()
 
 
 @partial(jax.jit, static_argnums=(2,))
@@ -712,9 +720,7 @@ def trace_back(rewards, done, gamma):
     all_v = jnp.flip(all_v, axis=0)
     return all_v
 
-def place_cell_centers(grid_size):
-    centers = jnp.array([[i, j] for i in range(grid_size) for j in range(grid_size)])
-    return centers
+
 
 
 def main(args):
@@ -727,7 +733,9 @@ def main(args):
     a = jax.random.randint(subkey, (args.n_agents, 1), 0, args.n_action)
     hippo_hidden = jnp.zeros((args.n_agents, args.hippo_hidden_size))
     theta = jnp.zeros((args.n_agents, args.theta_hidden_size))
-
+    # pc_centers = jnp.array([[i, j] for i in range(args.grid_size) for j in range(args.grid_size)])
+    grid_col, grid_row = jnp.meshgrid(jnp.arange(args.grid_size), jnp.arange(args.grid_size), indexing='ij')
+    pc_centers = jnp.concatenate((grid_row.reshape(-1, 1), grid_col.reshape(-1, 1)), axis=-1)
     
     if args.model_path[2:] not in os.listdir():
         os.mkdir(args.model_path)
@@ -758,12 +766,12 @@ def main(args):
             policy_state, hippo_state, encoder_state = train_step((encoder_state, hippo_state, policy_state),
                                                                       batch, args.replay_steps, args.clip_param, args.entropy_coef, args.n_train_time,
                                                                       args.policy_scan_len, subkey, args.hippo_pred_len, args.hippo_mem_len, args.grid_size, 
-                                                                      place_cell_centers(args.grid_size), args.pc_sigma)
+                                                                      pc_centers, args.pc_sigma)
             # buffer_state = buffer.clear_buffer(buffer_state)
         if ei % args.eval_every == args.eval_every - 1 and ei > args.max_size:
             print('train_rewards:', rewards.mean().item())
             key, subkey = jax.random.split(key)
-            eval_rewards = eval((buffer_state, encoder_state, hippo_state, policy_state), subkey, args)
+            eval_rewards = eval((encoder_state, hippo_state, policy_state), subkey, args)
             writer.add_scalar(f'eval_reward', eval_rewards, ei + 1)
             print('eval_rewards:', eval_rewards)
             for k, v in policy_state.metrics.compute().items():

@@ -29,14 +29,18 @@ def put_to_buffer(buffer_state, x):
 
 @partial(jax.jit, static_argnums=(1,))
 def sample_from_buffer(buffer_state, sample_len, key):
-    indices = jax.random.randint(key, (sample_len,), 0, buffer_state['max_size'], dtype=jnp.int8)
+    # indices = jax.random.randint(key, (sample_len,), 0, buffer_state['max_size'], dtype=jnp.int8)
+
     # indices = (jnp.arange(sample_len) + begin_index) % buffer_state['max_size']
+    begin_index = jax.random.randint(key, (1,), 0, buffer_state['max_size']-sample_len+1, dtype=jnp.int8)[0]
+    # begin_index = 0
+    indices = jnp.arange(sample_len) + begin_index
     # [s_a_r, new_hippo_hidden, theta, next_a, policy, value, done, next_s]
     batch = [jnp.take(buffer_state['buffer'][xi], indices, axis=0) for xi in range(len(buffer_state['buffer']))]
     batch = {'oe_ae_r': batch[0], 'hippo_hidden': batch[1], 'theta': batch[2],
              'next_action': batch[3], 'logits': batch[4], 'values': batch[5],
              'done': batch[6], 'obs': batch[7], 'prev_action': batch[8],
-             'new_hippo_hidden': batch[9], 'next_s': batch[10]}
+             'new_hippo_hidden': batch[9], 'next_s': batch[10], 'prev_s': batch[11]}
     return batch
 
 
