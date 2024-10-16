@@ -21,7 +21,53 @@ import numpy as np
 from matplotlib import pyplot as plt
 import train
 
-def render(ax, goal_s, wall_maze, s, grid_size):
+
+def parse_args():
+    # args.
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--hippo_lr', type=float, default=1e-4)
+    parser.add_argument('--policy_lr', type=float, default=1e-4)
+    parser.add_argument('--encoder_lr', type=float, default=1e-4)
+    parser.add_argument('--wd', type=float, default=0)
+    parser.add_argument('--train_every', type=int, default=400)
+    parser.add_argument('--n_agents', type=int, default=32)
+    parser.add_argument('--max_size', type=int, default=10000)  # max_size of buffer
+    parser.add_argument('--sample_len', type=int, default=64)  # sample len from buffer: at most max_size - 1
+    parser.add_argument('--epochs', type=int, default=int(1e6))
+
+    parser.add_argument('--replay_steps', type=int, default=4)  # todo: tune
+
+    parser.add_argument('--gamma', type=float, default=0.95)
+    parser.add_argument('--clip_param', type=float, default=0.2)
+    parser.add_argument('--entropy_coef', type=float, default=1e-2)
+    parser.add_argument('--n_train_time', type=int, default=6)
+    parser.add_argument('--eval_every', type=int, default=5000)
+    parser.add_argument('--n_eval_steps', type=int, default=200)
+    # params that should be the same with config.py
+    parser.add_argument('--hippo_hidden_size', type=int, default=64)
+    parser.add_argument('--theta_hidden_size', type=int, default=32)
+    parser.add_argument('--grid_size', type=int, default=4)
+    parser.add_argument('--n_action', type=int, default=4)
+    # parser.add_argument('--encoder_prefix', type=str, default=None)  # todo: checkpoint
+    # parser.add_argument('--hippo_prefix', type=str)
+    # parser.add_argument('--policy_prefix', type=str)
+
+    parser.add_argument('--prefix', type=str, required=True)
+
+    # Init params for hippo and policy
+    parser.add_argument('--bottleneck_size', type=int, default=4)
+    parser.add_argument('--policy_scan_len', type=int, default=20)
+    parser.add_argument('--hippo_mem_len', type=int, default=5)
+    parser.add_argument('--hippo_pred_len', type=int, default=5)
+    parser.add_argument('--pc_sigma', type=float, default=1)
+
+    parser.add_argument('--eval_temperature', type=float, default=1)
+    parser.add_argument('--seed', type=int, default=0)
+    args = parser.parse_args()
+    return args
+
+def render(ax, goal_s, wall_maze, s):
+    grid_size = wall_maze.shape[-2]
     ax.grid(visible=True)
     ax.set_xlim(0,grid_size)
     ax.set_ylim(grid_size,0)
@@ -50,34 +96,51 @@ def render(ax, goal_s, wall_maze, s, grid_size):
 
 
 def eval_video(args):
-    key = jax.random.PRNGKey(1)
+    key = jax.random.PRNGKey(args.seed)
     key, subkey = jax.random.split(key)
-    env_state, buffer_state, encoder_state, hippo_state, policy_state = train.init_states(args, subkey)
-    writer = SummaryWriter(f"./train_logs/{args.prefix}")
+    model_path = f'./modelzoo/{args.prefix}/{args.seed}'
+    env_state, buffer_state, encoder_state, hippo_state, policy_state = train.init_states(args, subkey, model_path)
     # Initialize actions, hippo_hidden, and theta ==================
     s = env_state['start_s']
     a = jax.random.randint(subkey, (args.n_agents, 1), 0, args.n_action)
     hippo_hidden = jnp.zeros((args.n_agents, args.hippo_hidden_size))
     theta = jnp.zeros((args.n_agents, args.theta_hidden_size))
-    # pc_centers = jnp.array([[i, j] for i in range(args.grid_size) for j in range(args.grid_size)])
-    grid_col, grid_row = jnp.meshgrid(jnp.arange(args.grid_size), jnp.arange(args.grid_size), indexing='ij')
-    pc_centers = jnp.concatenate((grid_row.reshape(-1, 1), grid_col.reshape(-1, 1)), axis=-1)
-    
-    if args.model_path[2:] not in os.listdir():
-        os.mkdir(args.model_path)
-    for ei in range(args.epochs):
+
+    n_step = 30
+    fig, axes = plt.subplots(n_step//10 * 2,10, figsize=(40,20))
+    axes = axes.flatten()
+    all_rewards = jnp.zeros((n_step,))
+    for ei in range(n_step):
         # walk in the env and update buffer (model_step)
         key, subkey = jax.random.split(subkey)
-        env_state, hippo_hidden, theta, next_s, next_a, rewards, done, replayed_history \
+        env_state, hippo_hidden, theta, next_s, next_a, rewards, done, hippo_output, replayed_history \
             = train.eval_step((env_state, encoder_state, hippo_state, policy_state),
                          subkey, s, a, hippo_hidden, theta, temperature=1, replay_steps=args.replay_steps)
-        # jax.debug.print('ei:{a},n:{b},rewards:{c},hippo:{d},theta:{e}',
-        #                 a=ei, b=2, c=rewards[2], d=hippo_hidden[2], e=theta[2])
+
+        render(axes[2*ei], env_state['goal_s'][0], env_state['wall_maze'][0], next_s[0])
+        pc_activation = hippo_output[0,:args.grid_size*args.grid_size]
+        pc_activation = jax.nn.softmax(pc_activation).reshape(args.grid_size, args.grid_size)
+        axes[2*ei+1].imshow(pc_activation)
+        mem_reward = hippo_output[0, args.grid_size*args.grid_size:-1]
+        pred_reward = jax.nn.sigmoid(hippo_output[0, -1])
+        axes[2*ei+1].set_title(f'{pred_reward:.1f}')
+        jax.debug.print('s:{a}, a:{b}, r:{c}, done:{d}, mem_r:{e}'.format(a=next_s[0], b=next_a[0], c=rewards[0], d=done[0], \
+                        e=mem_reward))
         s = next_s
         a = next_a
+        all_rewards = all_rewards.at[ei].set(rewards.mean().item())
+    print(all_rewards.mean())
+    [ax.axis('off') for ax in axes]
+    plt.tight_layout()
+    plt.subplots_adjust(wspace=0.1, hspace=0.1)
+    fig_path = f'figure/{args.prefix}/{args.seed}'
+    os.makedirs(fig_path, exist_ok=True)
+    plt.savefig(f'figure/{args.prefix}/{args.seed}/video.png')
+    print(f'figure/{args.prefix}/{args.seed}/video.png')
 
 
         
 
 if __name__ == '__main__':
-    pass
+    args = parse_args()
+    eval_video(args)

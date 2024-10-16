@@ -28,13 +28,11 @@ def parse_args():
     parser.add_argument('--encoder_lr', type=float, default=1e-4)
     parser.add_argument('--wd', type=float, default=0)
     parser.add_argument('--train_every', type=int, default=400)
-    parser.add_argument('--n_agents', type=int, default=32)
+    parser.add_argument('--n_agents', type=int, default=64)
     parser.add_argument('--max_size', type=int, default=10000)  # max_size of buffer
     parser.add_argument('--sample_len', type=int, default=64)  # sample len from buffer: at most max_size - 1
     parser.add_argument('--epochs', type=int, default=int(1e6))
-
-    parser.add_argument('--log_name', type=str, default='train_log')
-    parser.add_argument('--model_path', type=str, default='./modelzoo')
+    parser.add_argument('--reset_freq', type=int, default=100)
     parser.add_argument('--replay_steps', type=int, default=4)  # todo: tune
 
     parser.add_argument('--gamma', type=float, default=0.95)
@@ -48,9 +46,9 @@ def parse_args():
     parser.add_argument('--theta_hidden_size', type=int, default=32)
     parser.add_argument('--grid_size', type=int, default=4)
     parser.add_argument('--n_action', type=int, default=4)
-    parser.add_argument('--load_encoder', type=str, default=None)  # todo: checkpoint
-    parser.add_argument('--load_hippo', type=str)
-    parser.add_argument('--load_policy', type=str)
+    # parser.add_argument('--encoder_prefix', type=str, default=None)  # todo: checkpoint
+    # parser.add_argument('--hippo_prefix', type=str)
+    # parser.add_argument('--policy_prefix', type=str)
 
     parser.add_argument('--prefix', type=str, required=True)
 
@@ -62,6 +60,7 @@ def parse_args():
     parser.add_argument('--pc_sigma', type=float, default=1)
 
     parser.add_argument('--eval_temperature', type=float, default=1)
+    parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
     return args
 
@@ -208,6 +207,7 @@ def train_step(states, batch, replay_steps, clip_param, entropy_coef, n_train_ti
             index_to_scan = jnp.arange(sample_len - policy_scan_len) + index
             next_s_label_to_scan = jnp.take(next_s_label, index_to_scan, axis=0) # [t, n, 1]
             next_s_to_scan = jnp.take(batch['next_s'], index_to_scan, axis=0) # [t, n, 2]
+            reward_label_to_scan = jnp.take(batch['oe_ae_r'][:,:,-1], index_to_scan, axis=0) # [t, n, 1] 
             def generate_place_cell(x):
                 centers = pc_centers
                 sigma = pc_sigma
@@ -223,24 +223,30 @@ def train_step(states, batch, replay_steps, clip_param, entropy_coef, n_train_ti
                 return activation
             
             place_cell_activation = jax.vmap(generate_place_cell)(next_s_to_scan) # [t, n, m]
-            
+            assert place_cell_activation.shape == (sample_len - policy_scan_len, n_agents, num_cells)
+            # check
+            # jax.debug.print('s:{a}\n a:{b}\n sp:{c}',a=batch['prev_s'][0:3,0],b=batch['prev_action'][0:3,0],c=batch['next_s'][0:3,0])
+            # jax.debug.print('pc:{a}',a=place_cell_activation[0:3,0].reshape(-1, grid_size, grid_size))
+            # jax.debug.print('predict_pc:{a}',a=all_preds[0:3,0,:num_cells].reshape(-1, grid_size, grid_size))
+            pred_place = all_preds[:, :, :num_cells]
+            assert pred_place.shape == (sample_len - policy_scan_len, n_agents, num_cells)
+            pred_rewards = all_preds[:, :, -1]  # [l, n, 1+hml]
+            # mem_preds_rewards = all_preds[:, :, num_cells:]  # [l, n, 1+hml]
+            # preds_rewards = mem_preds_rewards[-hippo_pred_len:,:,-1]  # [hpl, n] Caution: hippo has no action information, so don't let it predict the next reward
 
-            preds_place = all_preds[:, :, :num_cells]
-            mem_preds_rewards = all_preds[:, :, num_cells:]  # [l, n, 1+hml]
-            preds_rewards = mem_preds_rewards[-hippo_pred_len-1:-1,:,-1]  # [hpl, n]
+            # mem_rewards = mem_preds_rewards[-hippo_pred_len-1,:,:-1]  # [n, hml]
+            # mem_rewards = jnp.transpose(mem_rewards, (1, 0))  # [hml, n]
 
-            mem_rewards = mem_preds_rewards[-hippo_pred_len-1,:,:-1]  # [n, hml]
-            mem_rewards = jnp.transpose(mem_rewards, (1, 0))  # [hml, n]
-
-            loss_pathint = optax.softmax_cross_entropy(preds_place, place_cell_activation).mean()
+            loss_pathint = optax.softmax_cross_entropy(pred_place, place_cell_activation).mean()
             # exclude the last step of place_cell prediction
             # [:-1]: not to pred the last place cell because of the masked rewards
             # [l, n]
-            acc_pred = (jnp.argmax(preds_place, axis=-1) == next_s_label_to_scan).astype(jnp.float32).mean()
+            acc_pred = (jnp.argmax(pred_place, axis=-1) == next_s_label_to_scan).astype(jnp.float32).mean()
 
             # pred last
-            rewards = batch['oe_ae_r'][:, :, -1]  # [l, n] # rt-1
-            rewards_label = rewards[-(hippo_pred_len+hippo_mem_len):]  # [hpl+hml, n]  # todo: 1: :-1; only predict the last one
+            # rewards_label = batch['oe_ae_r'][:, :, -1]  # [l, n] # rt-1
+            # rewards_label = rewards[-(hippo_pred_len+hippo_mem_len):]  # [hpl+hml, n]  # todo: 1: :-1; only predict the last one
+            # rewards_label = rewards[-hippo_pred_len:]
             # rewards_label = batch['rewards'][-(hippo_pred_len+hippo_mem_len):-hippo_pred_len,:,0]
             # state = jnp.concatenate((batch['action'], batch['current_pos'], batch['rewards'], preds_rewards, \
             #     batch['checked'], batch['step_count'], batch['reward_center'], jnp.argmax(batch['place_cells'],-1,keepdims=True), jnp.argmax(preds_place,-1,keepdims=True)),-1)
@@ -251,21 +257,23 @@ def train_step(states, batch, replay_steps, clip_param, entropy_coef, n_train_ti
             # jax.debug.print("preds_rewards_{shape}:{a}",shape=preds_rewards.shape,a=preds_rewards[:,0].reshape(-1))
             # st=0,1 at=2, rt=3, done=4, reward_center=5,6, step_count=7
 
-            all_r = jnp.concatenate((mem_rewards, preds_rewards),0)
-            loss_r = jnp.square(all_r - rewards_label)/2  # [hpl+hml, n]  # only consider the last hpl step
+            # all_r = jnp.concatenate((mem_rewards, preds_rewards),0)
+            # loss_r = jnp.square(all_r - rewards_label)/2  # [hpl+hml, n]  # only consider the last hpl step
+            loss_r = optax.sigmoid_binary_cross_entropy(pred_rewards, reward_label_to_scan).mean()
+            all_r = pred_rewards
 
-            recall_0 = jnp.where((loss_r < 0.1) & (jnp.abs(rewards_label - 0.) < 1e-3), 1, 0)  # todo: acc criterion: < 0.2
-            recall_r = jnp.where((loss_r < 0.1) & (jnp.abs(rewards_label - 0.5) < 1e-3), 1, 0)
-            recall_g = jnp.where((loss_r < 0.1) & (jnp.abs(rewards_label - 1.) < 1e-3), 1, 0)
+            recall_0 = jnp.where((loss_r < 0.1) & (jnp.abs(reward_label_to_scan - 0.) < 1e-3), 1, 0)  # todo: acc criterion: < 0.2
+            recall_r = jnp.where((loss_r < 0.1) & (jnp.abs(reward_label_to_scan - 0.5) < 1e-3), 1, 0)
+            recall_g = jnp.where((loss_r < 0.1) & (jnp.abs(reward_label_to_scan - 1.) < 1e-3), 1, 0)
 
-            precision_0 = jnp.where((jnp.abs(all_r - 0.) < 0.1)&(jnp.abs(rewards_label - 0.) < 1e-3), 1, 0)
-            precision_r = jnp.where((jnp.abs(all_r - 0.5) < 0.1)&(jnp.abs(rewards_label - 0.5) < 1e-3), 1, 0)
-            precision_g = jnp.where((jnp.abs(all_r - 1.) < 0.1)&(jnp.abs(rewards_label - 1.) < 1e-3), 1, 0)
-            loss_r = jnp.where(rewards_label > 0.4, loss_r * 40, loss_r).mean()  # todo: weighted loss, times by 10
+            precision_0 = jnp.where((jnp.abs(all_r - 0.) < 0.1)&(jnp.abs(reward_label_to_scan - 0.) < 1e-3), 1, 0)
+            precision_r = jnp.where((jnp.abs(all_r - 0.5) < 0.1)&(jnp.abs(reward_label_to_scan - 0.5) < 1e-3), 1, 0)
+            precision_g = jnp.where((jnp.abs(all_r - 1.) < 0.1)&(jnp.abs(reward_label_to_scan - 1.) < 1e-3), 1, 0)
+            # # loss_r = jnp.where(rewards_label > 0.4, loss_r * 40, loss_r).mean()  # todo: weighted loss, times by 10
 
-            recall_0 = jnp.sum(recall_0)/jnp.sum(jnp.where((jnp.abs(rewards_label-0)<1e-3),1,0))
-            recall_r = jnp.sum(recall_r)/jnp.sum(jnp.where((jnp.abs(rewards_label-0.5)<1e-3),1,0))
-            recall_g = jnp.sum(recall_g)/jnp.sum(jnp.where((jnp.abs(rewards_label-1)<1e-3),1,0))
+            recall_0 = jnp.sum(recall_0)/jnp.sum(jnp.where((jnp.abs(reward_label_to_scan-0)<1e-3),1,0))
+            recall_r = jnp.sum(recall_r)/jnp.sum(jnp.where((jnp.abs(reward_label_to_scan-0.5)<1e-3),1,0))
+            recall_g = jnp.sum(recall_g)/jnp.sum(jnp.where((jnp.abs(reward_label_to_scan-1)<1e-3),1,0))
             
             precision_0 = jnp.sum(precision_0)/jnp.sum(jnp.where((jnp.abs(all_r-0)<0.1),1,0))
             precision_r = jnp.sum(precision_r)/jnp.sum(jnp.where((jnp.abs(all_r-0.5)<0.1),1,0))
@@ -276,7 +284,7 @@ def train_step(states, batch, replay_steps, clip_param, entropy_coef, n_train_ti
             f1_g = 2*precision_g*recall_g/(precision_g+recall_g)
             # fixme: cumsum_rewards > 0.6, considering random reward value is 0.5, > 0.6 means the second time met a reward
             
-            loss = loss_pathint + loss_r * 0.8  # todo: *0.1
+            loss = loss_pathint + loss_r  # todo: *0.1
             return loss, (loss_r, loss_pathint, recall_0, recall_r, recall_g, \
                 precision_0, precision_r, precision_g, f1_0, f1_r, f1_g, acc_pred)
         
@@ -418,23 +426,12 @@ class TrainState(train_state.TrainState):
     metrics: Metrics
 
 
-def init_states(args, initkey):
+def init_states(args, initkey, model_path):
     if args.prefix == None:
         raise ValueError('prefix is None')
-    # print('theta:', args.theta_hidden_size)
-    # print('visual_prob:', args.visual_prob)
-    # print('policy_scan_len:', args.policy_scan_len)
-    # obs, env_state = env.reset(args.width, args.height, args.n_agents, initkey)
     maze_list = jnp.load('maze_list.npy')
     wall_maze = jnp.repeat(maze_list[0].reshape(1,args.grid_size,args.grid_size,args.n_action), args.n_agents, axis=0)
     start_s, env_state = env.reset(initkey, args.grid_size, args.n_agents, env_state={'wall_maze': wall_maze})
-    # print('n_train_time:', args.n_train_time)
-    # print('replay_steps:', args.replay_steps)
-    # print('total_epochs:', args.epochs)
-    # print('entropy_coef:', args.entropy_coef)
-    # print('drop_out_rate:', args.drop_out_rate)
-    # print('clip_param:', args.clip_param)
-    # print('weight_decay:', args.wd)
     print(args)
     # Load encoder =================================================================================
     key, subkey = jax.random.split(initkey)
@@ -443,24 +440,10 @@ def init_states(args, initkey):
     obs = jnp.zeros((args.n_agents, args.grid_size, args.grid_size, 5), dtype=jnp.int8)
     a = jnp.zeros((args.n_agents, 1), dtype=jnp.int8)
     params = encoder.init(subkey, obs, a)['params']
-
     encoder_state = TrainState.create(
         apply_fn=encoder.apply, params=params, tx=optax.adamw(args.encoder_lr, weight_decay=0.0),
         metrics=Metrics.empty())
-
-    if args.load_encoder != None:
-        load_encoder = args.model_path + '/' + args.load_encoder
-    else:
-        encoder_path = args.model_path + '/' + args.prefix + '_encoder'
-        load_encoder = encoder_path + '/' + os.listdir(encoder_path)[0]
-
-    if os.path.exists(load_encoder):
-        print('load encoder from:', load_encoder)
-    else:
-        print('path not exists:', load_encoder)
-        print('randomly initialize encoder')
-    encoder_state = checkpoints.restore_checkpoint(ckpt_dir=load_encoder,
-                                                            target=encoder_state)
+    # print(encoder_state)
     # Load Hippo ===========================================================================
     obs_embed, action_embed = encoder_state.apply_fn({'params': params}, obs, a)
     r = jnp.zeros((args.n_agents, 1))
@@ -472,24 +455,9 @@ def init_states(args, initkey):
                   bottleneck_size=args.bottleneck_size)
     hippo_hidden = jnp.zeros((args.n_agents, args.hippo_hidden_size))
     params = hippo.init(subkey, hippo_hidden, theta, oe_ae_r)['params']
-
     hippo_state = Hippo_TrainState.create(
         apply_fn=hippo.apply, params=params, tx=optax.adamw(args.hippo_lr, weight_decay=0.0),
         metrics=Hippo_Metrics.empty())
-
-    if args.load_hippo is not None:
-        load_hippo = args.model_path + '/' + args.load_hippo
-    else:
-        hippo_path = args.model_path + '/' + args.prefix + '_hippo'
-        load_hippo = hippo_path + '/' + os.listdir(hippo_path)[0]
-
-    if os.path.exists(load_hippo):
-        print('load hippo from:', load_hippo)
-    else:
-        print('path not exists:', load_hippo)
-        print('randomly initialize hippo')
-    hippo_state = checkpoints.restore_checkpoint(ckpt_dir=load_hippo,
-                                                            target=hippo_state)
 
     # Init policy state ===============================================================================
     policy = Policy(args.n_action, args.theta_hidden_size, args.bottleneck_size)
@@ -499,20 +467,16 @@ def init_states(args, initkey):
         apply_fn=policy.apply, params=params, tx=optax.adamw(args.policy_lr, weight_decay=args.wd),
         metrics=PFC_Metrics.empty())
 
-    load_policy = 'r'
-    if args.load_policy is not None:
-        load_policy = args.model_path + '/' + args.load_policy
+    states_loaded = {'encoder': encoder_state, 'hippo': hippo_state, 'policy': policy_state}
+    if os.path.exists(model_path):
+        print('load from:', model_path)
+        encoder_state = checkpoints.restore_checkpoint(ckpt_dir=f'{model_path}/encoder', target=encoder_state)
+        hippo_state = checkpoints.restore_checkpoint(ckpt_dir=f'{model_path}/hippo', target=hippo_state)
+        policy_state = checkpoints.restore_checkpoint(ckpt_dir=f'{model_path}/policy', target=policy_state)
     else:
-        for filename in os.listdir(args.model_path):
-            if filename.startswith(args.prefix + '_policy'):
-                load_policy = args.model_path + '/' + filename
-    if os.path.exists(load_policy):
-        print('load policy from:', load_policy)
-    else:
-        print('path not exists:', load_policy)
-        print('randomly initialize policy')
-    policy_state = checkpoints.restore_checkpoint(ckpt_dir=load_policy,
-                                                            target=policy_state)
+        print('path not exists:', model_path)
+        print('randomly initialize all states')
+
     # ===============================================
     # [s_a_r, new_hippo_hidden, theta, next_a, policy, value, done, next_s]
     init_samples_for_buffer = [oe_ae_r, hippo_hidden, theta,
@@ -567,7 +531,9 @@ def model_env_step(states, key, s, a, hippo_hidden, theta, temperature, replay_s
     # Mask obs ==========================================================================================
     key, subkey = jax.random.split(key)
     obs = env.get_obs(env_state, next_s) # [n, g, g, 5]
-    assert obs.shape == (args.n_agents, args.grid_size, args.grid_size, 5)
+    n_agents = next_s.shape[0]
+    grid_size = env_state['wall_maze'].shape[-2]
+    assert obs.shape == (n_agents, grid_size, grid_size, 5)
     # mask = jax.random.uniform(subkey, (wall_loc.shape[0], 1, 1))
     # obs_incomplete = jnp.where(obs == 2, 0, obs)
     # obs_incomplete = jnp.where(mask < visual_prob, obs_incomplete, 0)
@@ -627,7 +593,9 @@ def eval_step(states, key, s, a, hippo_hidden, theta, temperature, replay_steps)
     # Mask obs ==========================================================================================
     key, subkey = jax.random.split(key)
     obs = env.get_obs(env_state, next_s) # [n, g, g, 5]
-    assert obs.shape == (args.n_agents, args.grid_size, args.grid_size, 5)
+    n_agents = next_s.shape[0]
+    grid_size = env_state['wall_maze'].shape[-2]
+    assert obs.shape == (n_agents, grid_size, grid_size, 5)
     # mask = jax.random.uniform(subkey, (wall_loc.shape[0], 1, 1))
     # obs_incomplete = jnp.where(obs == 2, 0, obs)
     # obs_incomplete = jnp.where(mask < visual_prob, obs_incomplete, 0)
@@ -669,7 +637,7 @@ def eval_step(states, key, s, a, hippo_hidden, theta, temperature, replay_steps)
     # new_actions = jnp.argmax(policy, axis=-1, keepdims=True)
     next_a = sample_from_policy(policy, subkey, temperature)
     # fixme: reset reward; consider the checkpoint logic of env
-    return env_state, new_hippo_hidden, new_theta, next_s, next_a, rewards, done, replayed_history
+    return env_state, new_hippo_hidden, new_theta, next_s, next_a, rewards, done, output, replayed_history
 
 def eval(states, key, args):
     '''
@@ -690,10 +658,12 @@ def eval(states, key, args):
     theta = jnp.zeros((args.n_agents, args.theta_hidden_size))
     for i in range(args.n_eval_steps):
         key, subkey = jax.random.split(subkey)
-        env_state, hippo_hidden, theta, next_s, next_a, rewards, done, replayed_history \
+        env_state, hippo_hidden, theta, next_s, next_a, rewards, done, hippo_output, replayed_history \
             = eval_step((env_state, encoder_state, hippo_state, policy_state),
                          subkey, s, a, hippo_hidden, theta, temperature=args.eval_temperature, replay_steps=args.replay_steps)
         all_rewards = all_rewards.at[i].set(rewards.mean().item())
+        s = next_s
+        a = next_a
     return all_rewards.mean()
 
 
@@ -724,21 +694,23 @@ def trace_back(rewards, done, gamma):
 
 
 def main(args):
-    key = jax.random.PRNGKey(1)
+    key = jax.random.PRNGKey(args.seed)
     key, subkey = jax.random.split(key)
-    env_state, buffer_state, encoder_state, hippo_state, policy_state = init_states(args, subkey)
-    writer = SummaryWriter(f"./train_logs/{args.prefix}")
+    model_path = f'./modelzoo/{args.prefix}/{args.seed}'
+    env_state, buffer_state, encoder_state, hippo_state, policy_state = init_states(args, subkey, model_path)
+    writer = SummaryWriter(f"./train_logs/{args.prefix}/{args.seed}")
     # Initialize actions, hippo_hidden, and theta ==================
     s = env_state['start_s']
     a = jax.random.randint(subkey, (args.n_agents, 1), 0, args.n_action)
     hippo_hidden = jnp.zeros((args.n_agents, args.hippo_hidden_size))
     theta = jnp.zeros((args.n_agents, args.theta_hidden_size))
     # pc_centers = jnp.array([[i, j] for i in range(args.grid_size) for j in range(args.grid_size)])
-    grid_col, grid_row = jnp.meshgrid(jnp.arange(args.grid_size), jnp.arange(args.grid_size), indexing='ij')
+    grid_col, grid_row = jnp.meshgrid(jnp.arange(args.grid_size), jnp.arange(args.grid_size), indexing='xy')
     pc_centers = jnp.concatenate((grid_row.reshape(-1, 1), grid_col.reshape(-1, 1)), axis=-1)
     
-    if args.model_path[2:] not in os.listdir():
-        os.mkdir(args.model_path)
+    
+    if not os.path.exists(model_path):
+        os.makedirs(model_path)
     for ei in range(args.epochs):
         # walk in the env and update buffer (model_step)
         key, subkey = jax.random.split(subkey)
@@ -749,6 +721,10 @@ def main(args):
         #                 a=ei, b=2, c=rewards[2], d=hippo_hidden[2], e=theta[2])
         s = next_s
         a = next_a
+        if ei % args.reset_freq == args.reset_freq - 1:
+            s = env_state['start_s']
+            hippo_hidden = jnp.zeros((args.n_agents, args.hippo_hidden_size))
+            theta = jnp.zeros((args.n_agents, args.theta_hidden_size))
         if ei % 10 == 0:
             writer.add_scalar('train_reward', rewards.mean().item(), ei + 1)
 
@@ -780,7 +756,11 @@ def main(args):
             for k,v in hippo_state.metrics.compute().items():
                 print(k, v.item())
                 writer.add_scalar(f'hf_{k}', v.item(), ei + 1)
-            checkpoints.save_checkpoint(args.model_path, policy_state, ei + 1, prefix=args.prefix+'_policy_', overwrite=True)
+            # states_to_save = {'encoder': encoder_state, 'hippo': hippo_state, 'policy': policy_state}
+            # checkpoints.save_checkpoint(model_path, states_to_save, ei + 1, overwrite=True)
+            checkpoints.save_checkpoint(f'{model_path}/encoder', encoder_state, ei + 1, overwrite=True)
+            checkpoints.save_checkpoint(f'{model_path}/hippo', hippo_state, ei + 1, overwrite=True)
+            checkpoints.save_checkpoint(f'{model_path}/policy', policy_state, ei + 1, overwrite=True)
 
 if __name__ == '__main__':
     args = parse_args()

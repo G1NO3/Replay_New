@@ -108,7 +108,7 @@ class Hippo(nn.Module):
         input = jnp.concatenate((s_a_r, theta_info), axis=-1)
         new_hidden, output = nn.GRUCell()(hipp_hidden, input)
         # new_hidden, output = nn.GRUCell(features=self.hidden_size)(hipp_hidden, jnp.concatenate((obs_embed, action_embed, pfc_input, rewards), axis=-1))
-        output = nn.sigmoid(nn.Dense(self.output_size)(output))
+        output = nn.Dense(self.output_size)(output)
         return new_hidden, output, theta_info
 
 
