@@ -99,6 +99,7 @@ def train_step(states, batch, replay_steps, clip_param, entropy_coef, n_train_ti
     sample_len = batch['theta'].shape[0]
     n_agents = batch['theta'].shape[1]
     theta_hidden_size = batch['theta'].shape[-1]
+    hippo_hidden_size = batch['hippo_hidden'].shape[-1]
     num_cells = grid_size ** 2
     grid_size = batch['obs'].shape[-2]
     theta_zero = jnp.zeros((n_agents, theta_hidden_size))
@@ -122,66 +123,97 @@ def train_step(states, batch, replay_steps, clip_param, entropy_coef, n_train_ti
         # hippo_and_theta, policy_params, hippo_state, policy_state, s_a_r
 
 
-        def propagate_theta_hippo(key, index, policy_scan_len):
+        def propagate_hippo_theta(key, index, policy_scan_len):
             replay_fn_to_scan = partial(replay_fn, policy_params=policy_params, hippo_state=hippo_state, policy_state=policy_state,
                                     oe_ae_r=jnp.zeros_like(batch['oe_ae_r'][0]))
-            def propagate_hippo_once(prev_hippo_hidden, input_of_hippo):
-                prev_theta, obs, prev_action, prev_reward = input_of_hippo # ot, at-1, rt-1, θt-1
+            def propagate_hippo_theta_once(prev_hippo_hidden_theta, input_all):
+                prev_hippo_hidden, prev_theta = prev_hippo_hidden_theta
+                # print(f'prev_theta shape:{prev_theta.shape}, prev_hippo_hidden shape:{prev_hippo_hidden.shape}')
+                assert prev_theta.shape == (n_agents, theta_hidden_size)
+                assert prev_hippo_hidden.shape == (n_agents, hippo_hidden_size)
+                key, obs, prev_action, prev_reward = input_all
+                assert obs.shape == (n_agents, grid_size, grid_size, 6)
+                assert prev_action.shape == (n_agents, 1)
+                assert prev_reward.shape == (n_agents, 1)
                 obs_embed, action_embed = encoder_state.apply_fn({'params': encoder_params},
                                                                 obs, prev_action)
                 oe_ae_r = jnp.concatenate((obs_embed, action_embed, prev_reward), axis=-1)
-                new_hidden, output, theta_info = hippo_state.apply_fn({'params': hippo_params},
+                new_hippo_hidden, output, theta_info = hippo_state.apply_fn({'params': hippo_params},
                                                                     prev_hippo_hidden, prev_theta, oe_ae_r)
-                return new_hidden, output
-        
-            def propagate_theta_once(prev_theta, input_of_policy):
-                # [n, th]
-                # [n, 1], [n, h]
-                key, oe_ae_r, hippo_hidden = input_of_policy # ot, at-1, rt-1, ht
-                rewards = oe_ae_r[..., -1:]
                 replay_keys = jax.random.split(key, replay_steps + 1)
                 key, replay_keys = replay_keys[0], replay_keys[1:]
-                # outside_hipp_info = jnp.zeros((replay_steps, n_agents, bottleneck_size))
                 (replayed_hippo_hidden, replayed_theta), _ = jax.lax.scan(replay_fn_to_scan,
-                                                                        init=(hippo_hidden, prev_theta),
+                                                                        init=(new_hippo_hidden, prev_theta),
                                                                         xs=replay_keys)
-                # replayed_theta = prev_theta
-                # replayed_hippo_hidden = hippo_hidden
-
-                ### Gated by reward
-                # replayed_theta = jnp.where(rewards > 0, replayed_theta, prev_theta)
-                # replayed_hippo_hidden = jnp.where(rewards > 0, replayed_hippo_hidden,
-                #                                 jnp.zeros(replayed_hippo_hidden.shape))
-
-                # replayed_hippo_hidden = jnp.zeros(replayed_hippo_hidden.shape)
-                key, dropout_key = jax.random.split(key)
+                # key, dropout_key = jax.random.split(key)
                 # outside_hipp_info = jnp.zeros((n_agents, bottleneck_size))
                 new_theta, (policy, value, _) = policy_state.apply_fn({'params': policy_params},
                                                             replayed_hippo_hidden, replayed_theta, oe_ae_r)
-                # reset_theta = jnp.where(done & jnp.isclose(rewards, 0.), 0, new_theta)
+                return (new_hippo_hidden, new_theta), (output, policy, value)
+            
+            # def propagate_hippo_once(prev_hippo_hidden, input_of_hippo):
+            #     prev_theta, obs, prev_action, prev_reward = input_of_hippo # ot, at-1, rt-1, θt-1
+            #     obs_embed, action_embed = encoder_state.apply_fn({'params': encoder_params},
+            #                                                     obs, prev_action)
+            #     oe_ae_r = jnp.concatenate((obs_embed, action_embed, prev_reward), axis=-1)
+            #     new_hidden, output, theta_info = hippo_state.apply_fn({'params': hippo_params},
+            #                                                         prev_hippo_hidden, prev_theta, oe_ae_r)
+            #     return new_hidden, output
+        
+            # def propagate_theta_once(prev_theta, input_of_policy):
+            #     # [n, th]
+            #     # [n, 1], [n, h]
+            #     key, obs, prev_action, prev_reward, hippo_hidden = input_of_policy # ot, at-1, rt-1, ht
+            #     obs_embed, action_embed = encoder_state.apply_fn({'params': encoder_params},
+            #                                     obs, prev_action)
+            #     oe_ae_r = jnp.concatenate((obs_embed, action_embed, prev_reward), axis=-1)                         
+            #     replay_keys = jax.random.split(key, replay_steps + 1)
+            #     key, replay_keys = replay_keys[0], replay_keys[1:]
+            #     # outside_hipp_info = jnp.zeros((replay_steps, n_agents, bottleneck_size))
+            #     (replayed_hippo_hidden, replayed_theta), _ = jax.lax.scan(replay_fn_to_scan,
+            #                                                             init=(hippo_hidden, prev_theta),
+            #                                                             xs=replay_keys)
+            #     # replayed_theta = prev_theta
+            #     # replayed_hippo_hidden = hippo_hidden
 
-                return new_theta, (new_theta, policy, value)
+            #     ### Gated by reward
+            #     # replayed_theta = jnp.where(rewards > 0, replayed_theta, prev_theta)
+            #     # replayed_hippo_hidden = jnp.where(rewards > 0, replayed_hippo_hidden,
+            #     #                                 jnp.zeros(replayed_hippo_hidden.shape))
+
+            #     # replayed_hippo_hidden = jnp.zeros(replayed_hippo_hidden.shape)
+            #     key, dropout_key = jax.random.split(key)
+            #     # outside_hipp_info = jnp.zeros((n_agents, bottleneck_size))
+            #     new_theta, (policy, value, _) = policy_state.apply_fn({'params': policy_params},
+            #                                                 replayed_hippo_hidden, replayed_theta, oe_ae_r)
+            #     # reset_theta = jnp.where(done & jnp.isclose(rewards, 0.), 0, new_theta)
+
+            #     return new_theta, (new_theta, policy, value)
         
             indexes_for_propagate_once = jnp.arange(policy_scan_len) + index
-
+            init_hippo_hidden = batch['hippo_hidden'].at[index].get()
+            init_theta = batch['theta'].at[index].get()
             key_to_scan = jax.random.split(key, num=policy_scan_len + 1)
             key, key_to_scan = key_to_scan[0], key_to_scan[1:]
             oe_ae_r_to_scan = jnp.take(batch['oe_ae_r'], indexes_for_propagate_once, axis=0) # ot, at-1, rt-1
             # hippo_hidden_to_scan = jnp.take(batch['hippo_hidden'], indexes_for_propagate_once, axis=0) # ht-1
-            new_hippo_hidden_to_scan = jnp.take(batch['new_hippo_hidden'], indexes_for_propagate_once, axis=0) # ht
+            # new_hippo_hidden_to_scan = jnp.take(batch['new_hippo_hidden'], indexes_for_propagate_once, axis=0) # ht
             obs_to_scan = jnp.take(batch['obs'], indexes_for_propagate_once, axis=0) # ot
             # done_to_scan = jnp.take(batch['done'], indexes_for_propagate_once, axis=0) # done t-1
             prev_action_to_scan = jnp.take(batch['prev_action'], indexes_for_propagate_once, axis=0) # at-1
             prev_reward_to_scan = oe_ae_r_to_scan[..., -1:] # rt-1
-            prev_theta_to_scan = jnp.take(batch['theta'], indexes_for_propagate_once, axis=0) # theta t-1
+            # prev_theta_to_scan = jnp.take(batch['theta'], indexes_for_propagate_once, axis=0) # theta t-1
 
-            new_hippo_hidden, hist_hippo_output = jax.lax.scan(propagate_hippo_once,
-                                                         init=jnp.take(batch['hippo_hidden'], index, axis=0),
-                                                        xs=(prev_theta_to_scan, obs_to_scan, prev_action_to_scan, prev_reward_to_scan))
-            new_theta, (_, hist_policy, hist_value) = jax.lax.scan(propagate_theta_once,
-                                                                   init=jnp.take(batch['theta'], index, axis=0),
-                                                                   xs=(key_to_scan, oe_ae_r_to_scan, 
-                                                                       new_hippo_hidden_to_scan))
+            # new_hippo_hidden, hist_hippo_output = jax.lax.scan(propagate_hippo_once,
+            #                                              init=jnp.take(batch['hippo_hidden'], index, axis=0),
+            #                                             xs=(prev_theta_to_scan, obs_to_scan, prev_action_to_scan, prev_reward_to_scan))
+            # new_theta, (_, hist_policy, hist_value) = jax.lax.scan(propagate_theta_once,
+            #                                                        init=jnp.take(batch['theta'], index, axis=0),
+            #                                                        xs=(key_to_scan, obs_to_scan, prev_action_to_scan, prev_reward_to_scan, 
+            #                                                            new_hippo_hidden_to_scan))
+            (final_hippo_hidden, final_theta), (hist_hippo_output, hist_policy, hist_value) = jax.lax.scan(propagate_hippo_theta_once,
+                                                                                                         init=(init_hippo_hidden, init_theta),
+                                                                                                        xs=(key_to_scan, obs_to_scan, prev_action_to_scan, prev_reward_to_scan))
             return hist_policy, hist_value, hist_hippo_output
 
 
@@ -193,11 +225,11 @@ def train_step(states, batch, replay_steps, clip_param, entropy_coef, n_train_ti
         # his_replayed_theta = jnp.where(batch['his_rewards'] > 0, his_replayed_theta, batch['his_theta'])
         # using scan instead of jnp.where to ensure that gradients of each action should affect the invariable theta 
         # generated by the same previous replay 
-        propagate_theta_hippo_for_seq = partial(propagate_theta_hippo, policy_scan_len=policy_scan_len)
+        propagate_hippo_theta_for_seq = partial(propagate_hippo_theta, policy_scan_len=policy_scan_len)
         # sample_len - 1 - policy_scan_len
         key_to_propagate = jax.random.split(key, num=sample_len - policy_scan_len + 1)
         key, key_to_propagate = key_to_propagate[0], key_to_propagate[1:]
-        scan_policy_logits, scan_value, scan_hippo_output = jax.vmap(propagate_theta_hippo_for_seq, (0, 0), 0)(
+        scan_policy_logits, scan_value, scan_hippo_output = jax.vmap(propagate_hippo_theta_for_seq, (0, 0), 0)(
             key_to_propagate, jnp.arange(sample_len - policy_scan_len))
         # [b-psl, psl, n, h], [b-psl, psl, n, 1], [b-psl, psl, n, h], all at time t (received the input ot, at-1 and rt-1)
 
@@ -437,7 +469,7 @@ def init_states(args, initkey, model_path):
     key, subkey = jax.random.split(initkey)
     encoder = Encoder()
     s = jnp.zeros((args.n_agents, 2), dtype=jnp.int8)
-    obs = jnp.zeros((args.n_agents, args.grid_size, args.grid_size, 5), dtype=jnp.int8)
+    obs = jnp.zeros((args.n_agents, args.grid_size, args.grid_size, 6), dtype=jnp.int8)
     a = jnp.zeros((args.n_agents, 1), dtype=jnp.int8)
     params = encoder.init(subkey, obs, a)['params']
     encoder_state = TrainState.create(
@@ -489,7 +521,7 @@ def init_states(args, initkey, model_path):
         # done
         jnp.zeros((args.n_agents, 1), dtype=jnp.int8),
         # obs
-        jnp.zeros((args.n_agents, args.grid_size, args.grid_size, 5), dtype=jnp.int8),
+        jnp.zeros((args.n_agents, args.grid_size, args.grid_size, 6), dtype=jnp.int8),
         # prev actions
         jnp.zeros((args.n_agents, 1), dtype=jnp.int8),
         # new hippo_hidden
@@ -533,7 +565,7 @@ def model_env_step(states, key, s, a, hippo_hidden, theta, temperature, replay_s
     obs = env.get_obs(env_state, next_s) # [n, g, g, 5]
     n_agents = next_s.shape[0]
     grid_size = env_state['wall_maze'].shape[-2]
-    assert obs.shape == (n_agents, grid_size, grid_size, 5)
+    assert obs.shape == (n_agents, grid_size, grid_size, 6)
     # mask = jax.random.uniform(subkey, (wall_loc.shape[0], 1, 1))
     # obs_incomplete = jnp.where(obs == 2, 0, obs)
     # obs_incomplete = jnp.where(mask < visual_prob, obs_incomplete, 0)
@@ -595,7 +627,7 @@ def eval_step(states, key, s, a, hippo_hidden, theta, temperature, replay_steps)
     obs = env.get_obs(env_state, next_s) # [n, g, g, 5]
     n_agents = next_s.shape[0]
     grid_size = env_state['wall_maze'].shape[-2]
-    assert obs.shape == (n_agents, grid_size, grid_size, 5)
+    assert obs.shape == (n_agents, grid_size, grid_size, 6)
     # mask = jax.random.uniform(subkey, (wall_loc.shape[0], 1, 1))
     # obs_incomplete = jnp.where(obs == 2, 0, obs)
     # obs_incomplete = jnp.where(mask < visual_prob, obs_incomplete, 0)
@@ -697,6 +729,8 @@ def main(args):
     key = jax.random.PRNGKey(args.seed)
     key, subkey = jax.random.split(key)
     model_path = f'./modelzoo/{args.prefix}/{args.seed}'
+    maze_list = jnp.load('maze_list.npy')
+    wall_maze = jnp.repeat(maze_list[0].reshape(1,args.grid_size,args.grid_size,args.n_action), args.n_agents, axis=0)
     env_state, buffer_state, encoder_state, hippo_state, policy_state = init_states(args, subkey, model_path)
     writer = SummaryWriter(f"./train_logs/{args.prefix}/{args.seed}")
     # Initialize actions, hippo_hidden, and theta ==================
@@ -722,6 +756,8 @@ def main(args):
         s = next_s
         a = next_a
         if ei % args.reset_freq == args.reset_freq - 1:
+            key, subkey = jax.random.split(key)
+            start_s, env_state = env.reset(subkey, args.grid_size, args.n_agents, env_state={'wall_maze': wall_maze})
             s = env_state['start_s']
             hippo_hidden = jnp.zeros((args.n_agents, args.hippo_hidden_size))
             theta = jnp.zeros((args.n_agents, args.theta_hidden_size))

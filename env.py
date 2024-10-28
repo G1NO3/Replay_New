@@ -40,7 +40,8 @@ def get_obs(env_state, s):
     grid = jax.vmap(partial(set_value, value=1))(grid, s) # set current state to 1
     grid = jax.vmap(partial(set_value, value=2))(grid, env_state['start_s']) # set start state to 2
     grid = grid.reshape(grid.shape[0], grid.shape[1], grid.shape[2], 1)
-    obs = jnp.concatenate((env_state['wall_maze'], grid), axis=-1)
+    reward_map = env_state['reward_map'].reshape(env_state['reward_map'].shape[0], env_state['reward_map'].shape[1], env_state['reward_map'].shape[2], 1)
+    obs = jnp.concatenate((env_state['wall_maze'], grid, reward_map), axis=-1)
     return obs
 
 def get_value(reward_map, s):
@@ -55,8 +56,8 @@ def set_value(grid, loc, value):
 #     return grid
 
 def regenerate_reward(key, reward_map, reward_location):
-    # new_reward_location = jax.random.randint(key, reward_location.shape, 0, reward_map.shape[-1]) # Regenerate reward location
-    new_reward_location = jnp.zeros((reward_location.shape[0], 2), dtype=jnp.int8)
+    new_reward_location = jax.random.randint(key, reward_location.shape, 0, reward_map.shape[-1]) # Regenerate reward location
+    # new_reward_location = jnp.zeros((reward_location.shape[0], 2), dtype=jnp.int8)
     def set_value(grid, loc, value):
         return grid.at[loc[0], loc[1]].set(value)
     new_reward_map = jax.vmap(partial(set_value, value=0))(reward_map, reward_location)# Remove reward from old location
