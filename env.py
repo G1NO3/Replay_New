@@ -168,16 +168,30 @@ def render(env_state, s, grid_size):
 
 if __name__ == '__main__':
     key = jax.random.PRNGKey(0)
-    grid_size = 5
-    env_state = reset(key, grid_size)
+    grid_size = 4
+    n_action = 4
+    n_agents = 1
+    maze_list = jnp.load('maze_list.npy')
+    print('maze', maze_list.shape)
+    wall_maze = jnp.repeat(maze_list[0].reshape(1, grid_size, grid_size, n_action), n_agents,
+                           axis=0)
+    key, subkey = jax.random.split(key)
+    start_s, env_state = reset(subkey, grid_size, n_agents, env_state={'wall_maze': wall_maze})
     # print(start_location)
     print(env_state['goal_s'])
     print(env_state['reward_map'])
-    print(env_state['wall_maze'])
+    # print(env_state['wall_maze'])
     s = env_state['start_s']
     screen, clock = None, None
     while True:
         a = int(input('Action:'))
-        next_s, reward, done = step(env_state, s, a)
-        screen, clock = render(screen, clock, env_state, next_s)
+        a = jnp.array([a for _ in range(n_agents)]).reshape(-1, 1)
+        key, subkey = jax.random.split(key)
+        next_s, reward, done, env_state = step(subkey, env_state, s, a)
+        obs = get_obs(env_state, next_s)
+        s = next_s
+        print('s r done', next_s, reward, done)
+        print('s', obs[:, :, :, -2])
+        print('r', obs[:, :, :, -1])
+        # render(env_state, next_s, grid_size)
         # print(next_s, reward, done)

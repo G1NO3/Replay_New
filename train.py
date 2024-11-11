@@ -397,28 +397,28 @@ def train_step(states, batch, replay_steps, clip_param, entropy_coef, n_train_ti
         loss_pathint = losses_pathint.mean()
         loss_r = losses_r.mean()
         acc_pred = acc_preds.mean()
-        loss = pfc_loss + hf_loss
+        loss = pfc_loss   # todo: + hf_loss
         return loss, (pfc_loss, action_loss, entropy_loss, value_loss, approx_kl, hf_loss, loss_pathint, loss_r, acc_pred)
 
-    for _ in range(n_train_time):
-        ###FIXME
-        key, subkey = jax.random.split(key)
-        grad_fn = jax.value_and_grad(partial(loss_fn, batch=batch, key=key), has_aux=True, argnums=(0, 1, 2))
-        (loss, (pfc_loss, action_loss, entropy_loss, value_loss, approx_kl, hf_loss, loss_pathint, loss_r, acc_pred)), \
-            (policy_grad, hippo_grad, encoder_grad) = grad_fn(policy_state.params, hippo_state.params, encoder_state.params)
-        # print('encoder_grad:',encoder_grad)
-        clip_fn = lambda z: z / jnp.maximum(jnp.linalg.norm(z.flatten(), ord=2), 1)  # fixme: clip by value / by grad
+    # for _ in range(n_train_time):
+    #     ###FIXME
+    key, subkey = jax.random.split(key)
+    grad_fn = jax.value_and_grad(partial(loss_fn, batch=batch, key=key), has_aux=True, argnums=(0, 1, 2))
+    (loss, (pfc_loss, action_loss, entropy_loss, value_loss, approx_kl, hf_loss, loss_pathint, loss_r, acc_pred)), \
+        (policy_grad, hippo_grad, encoder_grad) = grad_fn(policy_state.params, hippo_state.params, encoder_state.params)
+    # print('encoder_grad:',encoder_grad)
+    clip_fn = lambda z: z / jnp.maximum(jnp.linalg.norm(z.flatten(), ord=2), 1)  # fixme: clip by value / by grad
 
-        # jax.debug.breakpoint()
-        jax.debug.print('grad_{a}_{b}_{c}', a=jnp.linalg.norm(policy_grad['Dense_0']['kernel'], ord=2),
-                                        b=jnp.linalg.norm(hippo_grad['GRUCell_0']['hz']['kernel'], ord=2),
-                                        c=jnp.linalg.norm(encoder_grad['Conv_0']['kernel'].flatten(), ord=2))
-        # policy_grad = jax.tree_util.tree_map(clip_fn, policy_grad)
-        # hippo_grad = jax.tree_util.tree_map(clip_fn, hippo_grad)
-        # encoder_grad = jax.tree_util.tree_map(clip_fn, encoder_grad)
-        policy_state = policy_state.apply_gradients(grads=policy_grad)
-        hippo_state = hippo_state.apply_gradients(grads=hippo_grad)
-        encoder_state = encoder_state.apply_gradients(grads=encoder_grad)
+    # jax.debug.breakpoint()
+    jax.debug.print('grad_{a}_{b}_{c}', a=jnp.linalg.norm(policy_grad['Dense_0']['kernel'], ord=2),
+                                    b=jnp.linalg.norm(hippo_grad['GRUCell_0']['hz']['kernel'], ord=2),
+                                    c=jnp.linalg.norm(encoder_grad['Conv_0']['kernel'].flatten(), ord=2))
+    # policy_grad = jax.tree_util.tree_map(clip_fn, policy_grad)
+    # hippo_grad = jax.tree_util.tree_map(clip_fn, hippo_grad)
+    # encoder_grad = jax.tree_util.tree_map(clip_fn, encoder_grad)
+    policy_state = policy_state.apply_gradients(grads=policy_grad)
+    hippo_state = hippo_state.apply_gradients(grads=hippo_grad)
+    encoder_state = encoder_state.apply_gradients(grads=encoder_grad)
 
     # compute metrics
     pfc_metric_updates = policy_state.metrics.single_from_model_output(
@@ -462,7 +462,10 @@ def init_states(args, initkey, model_path):
     if args.prefix == None:
         raise ValueError('prefix is None')
     maze_list = jnp.load('maze_list.npy')
-    wall_maze = jnp.repeat(maze_list[0].reshape(1,args.grid_size,args.grid_size,args.n_action), args.n_agents, axis=0)
+    # wall_maze = jnp.repeat(maze_list[0].reshape(1,args.grid_size,args.grid_size,args.n_action), args.n_agents, axis=0)
+    initkey, subkey = jax.random.split(initkey)
+    sample_indices = jax.random.choice(subkey, maze_list.shape[0], shape=(args.n_agents,), replace=False)
+    wall_maze = maze_list[sample_indices]
     start_s, env_state = env.reset(initkey, args.grid_size, args.n_agents, env_state={'wall_maze': wall_maze})
     print(args)
     # Load encoder =================================================================================
@@ -681,7 +684,10 @@ def eval(states, key, args):
     all_rewards = jnp.zeros((args.n_eval_steps,))
     key, subkey = jax.random.split(key)
     maze_list = jnp.load('maze_list.npy')
-    wall_maze = jnp.repeat(maze_list[0].reshape(1,args.grid_size,args.grid_size,args.n_action), args.n_agents, axis=0)
+    # wall_maze = jnp.repeat(maze_list[0].reshape(1,args.grid_size,args.grid_size,args.n_action), args.n_agents, axis=0)
+    key, subkey = jax.random.split(key)
+    sample_indices = jax.random.choice(subkey, maze_list.shape[0], shape=(args.n_agents,), replace=False)
+    wall_maze = maze_list[sample_indices]
     start_s, env_state = env.reset(subkey, args.grid_size, args.n_agents, env_state={'wall_maze': wall_maze})
     key, subkey = jax.random.split(key)
     s = env_state['start_s']
@@ -699,8 +705,8 @@ def eval(states, key, args):
     return all_rewards.mean()
 
 
-@partial(jax.jit, static_argnums=(2,))
-def trace_back(rewards, done, gamma):
+@partial(jax.jit, static_argnums=(3,))
+def trace_back(rewards, done, values, gamma):
     # rewards [l, n, 1], carry, y = f(carry, x)
     t, n, _ = rewards.shape
 
@@ -723,6 +729,37 @@ def trace_back(rewards, done, gamma):
     return all_v
 
 
+@partial(jax.jit, static_argnums=(3, 4))
+def trace_back(rewards, done, values, gamma, gae_lambda=0.95):
+
+    # rewards [l, n, 1], carry, y = f(carry, x)
+    t, n, _ = rewards.shape
+    # values [l, n]
+    # # rt, vt+1
+    rewards = rewards[1:].reshape(t-1, n)  # rt (the last item)
+    next_done = done[1:].reshape(t-1, n)
+    next_values = values[1:].reshape(t - 1, n)  # vt+1
+    values = values[:-1].reshape(t-1, n)  # vt
+
+    # # rt, vt
+    # rewards = rewards[:-1].reshape(t - 1, n)  # rt-1 (the last item)
+    # # next_done = done[1:].reshape(t-1, n)  # [done_t]
+    # next_done = done[:-1].reshape(t - 1, n)
+    # next_values = values[1:].reshape(t - 1, n)  # vt
+    # values = values[:-1].reshape(t - 1, n)  # vt-1
+
+    delta = rewards + gamma * next_values * (1 - next_done.astype(jnp.float32)) - values
+
+    def trace_gae(last_gae, delta_done):
+        delta, next_done = delta_done
+        # adv_T[n,]; delta[n]
+        last_gae = delta + gamma * gae_lambda * (1 - next_done.astype(jnp.float32)) * last_gae
+        return last_gae, last_gae
+
+    _, advantage = jax.lax.scan(trace_gae, jnp.zeros((n,)), (jnp.flip(delta, axis=0), jnp.flip(next_done, axis=0)))
+    advantage = jnp.flip(advantage, axis=0)  # [t-1, n]
+    advantage = jnp.concatenate((advantage, jnp.zeros((1, n))), axis=0)
+    return (advantage + jnp.concatenate((jnp.zeros((1, n)), values), axis=0)).reshape(t, n, 1)  # 0+vt-1
 
 
 def main(args):
@@ -730,7 +767,10 @@ def main(args):
     key, subkey = jax.random.split(key)
     model_path = f'./modelzoo/{args.prefix}/{args.seed}'
     maze_list = jnp.load('maze_list.npy')
-    wall_maze = jnp.repeat(maze_list[0].reshape(1,args.grid_size,args.grid_size,args.n_action), args.n_agents, axis=0)
+    # wall_maze = jnp.repeat(maze_list[0].reshape(1,args.grid_size,args.grid_size,args.n_action), args.n_agents, axis=0)
+    key, subkey = jax.random.split(key)
+    sample_indices = jax.random.choice(subkey, maze_list.shape[0], shape=(args.n_agents,), replace=False)
+    wall_maze = maze_list[sample_indices]
     env_state, buffer_state, encoder_state, hippo_state, policy_state = init_states(args, subkey, model_path)
     writer = SummaryWriter(f"./train_logs/{args.prefix}/{args.seed}")
     # Initialize actions, hippo_hidden, and theta ==================
@@ -757,6 +797,9 @@ def main(args):
         a = next_a
         if ei % args.reset_freq == args.reset_freq - 1:
             key, subkey = jax.random.split(key)
+            sample_indices = jax.random.choice(subkey, maze_list.shape[0], shape=(args.n_agents,), replace=False)
+            wall_maze = maze_list[sample_indices]
+            key, subkey = jax.random.split(key)
             start_s, env_state = env.reset(subkey, args.grid_size, args.n_agents, env_state={'wall_maze': wall_maze})
             s = env_state['start_s']
             hippo_hidden = jnp.zeros((args.n_agents, args.hippo_hidden_size))
@@ -767,19 +810,19 @@ def main(args):
         if ei % args.train_every == args.train_every - 1 and ei > args.max_size:
             # train for a step and empty buffer
             print(ei + 1)
-            # for _ in range(args.n_train_time):
-            key, subkey = jax.random.split(key)
-            batch = buffer.sample_from_buffer(buffer_state, args.sample_len, subkey)
-            # batch['his_rewards'] = batch['his_rewards'] - 0.05
-            # batch['his_rewards'] = jnp.where(batch['step_count']==100, batch['his_rewards']-1, batch['his_rewards'])
-            rewards = batch['oe_ae_r'][..., -1:]
-            batch['his_traced_rewards'] = trace_back(rewards, batch['done'], args.gamma)
-            key, subkey = jax.random.split(key)
-            policy_state, hippo_state, encoder_state = train_step((encoder_state, hippo_state, policy_state),
-                                                                      batch, args.replay_steps, args.clip_param, args.entropy_coef, args.n_train_time,
-                                                                      args.policy_scan_len, subkey, args.hippo_pred_len, args.hippo_mem_len, args.grid_size, 
-                                                                      pc_centers, args.pc_sigma)
-            # buffer_state = buffer.clear_buffer(buffer_state)
+            for _ in range(args.n_train_time):
+                key, subkey = jax.random.split(key)
+                batch = buffer.sample_from_buffer(buffer_state, args.sample_len, subkey)
+                # batch['his_rewards'] = batch['his_rewards'] - 0.05
+                # batch['his_rewards'] = jnp.where(batch['step_count']==100, batch['his_rewards']-1, batch['his_rewards'])
+                rewards = batch['oe_ae_r'][..., -1:]
+                batch['his_traced_rewards'] = trace_back(rewards, batch['done'], batch['values'], args.gamma)
+                key, subkey = jax.random.split(key)
+                policy_state, hippo_state, encoder_state = train_step((encoder_state, hippo_state, policy_state),
+                                                                          batch, args.replay_steps, args.clip_param, args.entropy_coef, args.n_train_time,
+                                                                          args.policy_scan_len, subkey, args.hippo_pred_len, args.hippo_mem_len, args.grid_size,
+                                                                          pc_centers, args.pc_sigma)
+            buffer_state = buffer.clear_buffer(buffer_state)
         if ei % args.eval_every == args.eval_every - 1 and ei > args.max_size:
             print('train_rewards:', rewards.mean().item())
             key, subkey = jax.random.split(key)
@@ -789,9 +832,9 @@ def main(args):
             for k, v in policy_state.metrics.compute().items():
                 print(k, v.item())
                 writer.add_scalar(f'pfc_{k}', v.item(), ei + 1)
-            for k,v in hippo_state.metrics.compute().items():
-                print(k, v.item())
-                writer.add_scalar(f'hf_{k}', v.item(), ei + 1)
+            # for k,v in hippo_state.metrics.compute().items():
+            #     print(k, v.item())
+            #     writer.add_scalar(f'hf_{k}', v.item(), ei + 1)
             # states_to_save = {'encoder': encoder_state, 'hippo': hippo_state, 'policy': policy_state}
             # checkpoints.save_checkpoint(model_path, states_to_save, ei + 1, overwrite=True)
             checkpoints.save_checkpoint(f'{model_path}/encoder', encoder_state, ei + 1, overwrite=True)
